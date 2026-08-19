@@ -20,8 +20,11 @@ optional params:
 - --request-option num_steps=40 (as low as 8 still sounds acceptable with faster generation - depends on quality of your reference audio)
 - --request-option seed=420
 - --request-option cfg_scale_speaker=16
-<br /><br />
-<br /><br />
+  
+
+Server:<br /><br />
+./build/linux-cuda-release/bin/audiocpp_server --config echotts-server.json
+<br /><br /><br /><br />
 This was entirely vibe coded so perhaps it is useful as inspiration to write a proper submission for audio.cpp but I'd rather not try to merge this myself.
 <br /><br /><br /><br /><br /><br /><br /><br /><br />
 [![0xShug0/audio.cpp | Trendshift](https://trendshift.io/api/badge/trendshift/repositories/64983/daily?language=C%2B%2B)](https://trendshift.io/repositories/64983?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-64983)
