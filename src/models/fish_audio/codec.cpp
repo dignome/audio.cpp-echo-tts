@@ -549,9 +549,11 @@ core::TensorValue build_quantizer_out(
     return modules::Conv1dModule({8, kCodecDim, 1, 1, 0, 1, true}).build(ctx, emb_bdt, weights.out_proj);
 }
 
-core::TensorValue build_decode_quantizer(
+// Dequantises codes into the continuous z_q space, which is the boundary the
+// Echo-TTS family enters at. Kept separate from the post_module/upsample tail so
+// both a code-driven decode and a latent-driven decode can share that tail.
+core::TensorValue build_zq_from_codes(
     core::ModuleBuildContext & ctx,
-    core::ConstantTensorCache & constants,
     const std::vector<core::TensorValue> & code_inputs,
     const FishCodecWeights & weights) {
     auto latent = build_quantizer_out(ctx, code_inputs[0], weights.semantic_quantizer, 4096);
@@ -559,12 +561,31 @@ core::TensorValue build_decode_quantizer(
         auto residual = build_quantizer_out(ctx, code_inputs[index + 1], weights.residual_quantizers[index], 1024);
         latent = modules::AddModule{}.build(ctx, latent, residual);
     }
-    latent = build_window_transformer(ctx, constants, latent, weights.post_module, 128);
+    return latent;
+}
+
+// post_module -> upsample. This is exactly the body of DAC.decode_zq in the
+// upstream Echo-TTS autoencoder, which is why it is factored out.
+core::TensorValue build_decode_from_zq(
+    core::ModuleBuildContext & ctx,
+    core::ConstantTensorCache & constants,
+    const core::TensorValue & z_q,
+    const FishCodecWeights & weights) {
+    auto latent = build_window_transformer(ctx, constants, z_q, weights.post_module, 128);
     for (const auto & stage : weights.upsample) {
         latent = causal_conv_transpose1d(ctx, latent, stage.first, kCodecDim, kCodecDim, 2, 2, true);
         latent = build_convnext(ctx, latent, stage.second, kCodecDim);
     }
     return latent;
+}
+
+core::TensorValue build_decode_quantizer(
+    core::ModuleBuildContext & ctx,
+    core::ConstantTensorCache & constants,
+    const std::vector<core::TensorValue> & code_inputs,
+    const FishCodecWeights & weights) {
+    return build_decode_from_zq(
+        ctx, constants, build_zq_from_codes(ctx, code_inputs, weights), weights);
 }
 
 core::TensorValue build_encode_quantizer(
@@ -573,7 +594,8 @@ core::TensorValue build_encode_quantizer(
     const core::TensorValue & encoder_latent,
     const FishCodecWeights & weights,
     std::vector<ggml_tensor *> & code_outputs,
-    std::vector<std::pair<std::string, core::TensorValue>> & trace_outputs) {
+    std::vector<std::pair<std::string, core::TensorValue>> & trace_outputs,
+    core::TensorValue * z_q_out) {
     auto x = encoder_latent;
     for (const auto & stage : weights.downsample) {
         x = causal_conv1d(ctx, x, stage.first, kCodecDim, kCodecDim, 2, 2, 1, true);
@@ -606,6 +628,14 @@ core::TensorValue build_encode_quantizer(
     quantize_one(weights.semantic_quantizer, 4096);
     for (const auto & quantizer : weights.residual_quantizers) {
         quantize_one(quantizer, 1024);
+    }
+    if (z_q_out != nullptr) {
+        // DAC.encode_zq sums the dequantised contribution of every codebook.
+        // Each quantize_one subtracts exactly that contribution from `residual`,
+        // which starts at `x`, so the sum is the difference between the two.
+        // This avoids a second accumulator and stays exact by construction.
+        *z_q_out = core::wrap_tensor(
+            ggml_sub(ctx.ggml, x.tensor, residual.tensor), x.shape, GGML_TYPE_F32);
     }
     return x;
 }
@@ -936,6 +966,104 @@ private:
     core::ConstantTensorCache constants_;
 };
 
+// Decodes continuous z_q latents rather than discrete codes. Shares the whole
+// post_module -> upsample -> decoder tail with DecodeGraph via
+// build_decode_from_zq; only the input differs. Added for Echo-TTS, whose DiT
+// generates latents directly and never produces codebook indices.
+struct LatentDecodeGraph {
+    LatentDecodeGraph(
+        std::shared_ptr<const FishAudioAssets> assets,
+        std::shared_ptr<const FishCodecWeights> weights,
+        core::ExecutionContext & execution_context,
+        size_t graph_arena_bytes,
+        int64_t frames)
+        : assets_(std::move(assets)),
+          weights_(std::move(weights)),
+          backend_(execution_context.backend()),
+          backend_type_(execution_context.backend_type()),
+          threads_(std::max(1, execution_context.config().threads)),
+          frame_capacity_(frames),
+          constants_(backend_, threads_, "Fish Audio codec latent decode constants") {
+        ggml_init_params params{graph_arena_bytes, nullptr, true};
+        ctx_.reset(ggml_init(params));
+        if (ctx_ == nullptr) {
+            throw std::runtime_error("failed to initialize Fish Audio codec latent decode graph context");
+        }
+        core::ModuleBuildContext ctx{ctx_.get(), "fish_audio.codec.latent_decode", backend_type_};
+        constants_.begin_graph();
+        // (batch, channels, time), matching what the quantizer tail expects.
+        latent_input_ = core::make_tensor(
+            ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, kCodecDim, frame_capacity_}));
+        ggml_set_input(latent_input_.tensor);
+        auto latent = build_decode_from_zq(ctx, constants_, latent_input_, *weights_);
+        auto waveform = build_decoder(ctx, latent, *weights_);
+        output_ = waveform.tensor;
+        ggml_set_output(output_);
+        graph_ = ggml_new_graph_custom(ctx_.get(), 1048576, false);
+        ggml_build_forward_expand(graph_, output_);
+        constants_.finish_graph();
+        constants_.ensure_uploaded();
+        gallocr_.reset(ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_)));
+        if (gallocr_ == nullptr || !ggml_gallocr_alloc_graph(gallocr_.get(), graph_)) {
+            throw std::runtime_error("failed to allocate Fish Audio codec latent decode graph");
+        }
+    }
+
+    ~LatentDecodeGraph() {
+        engine::core::release_backend_graph_resources(backend_, graph_);
+    }
+
+    bool matches(int64_t frames, ggml_backend_t backend, int threads) const {
+        return frame_capacity_ >= frames && backend_ == backend && threads_ == std::max(1, threads);
+    }
+
+    // `latents` is (frames, kCodecDim) row-major, which is the layout the PCA
+    // inverse produces. It is transposed here into the (channels, time) order
+    // ggml holds, and zero-padded out to the graph's frame capacity.
+    runtime::AudioBuffer run(const std::vector<float> & latents, int64_t frames) {
+        if (frames <= 0 || static_cast<int64_t>(latents.size()) != frames * kCodecDim) {
+            throw std::runtime_error("Fish Audio codec latent decode received a mis-shaped latent buffer");
+        }
+        if (frames > frame_capacity_) {
+            throw std::runtime_error("Fish Audio codec latent decode request exceeds graph capacity");
+        }
+        std::vector<float> padded(static_cast<size_t>(kCodecDim * frame_capacity_), 0.0F);
+        for (int64_t frame = 0; frame < frames; ++frame) {
+            for (int64_t channel = 0; channel < kCodecDim; ++channel) {
+                padded[static_cast<size_t>(channel * frame_capacity_ + frame)] =
+                    latents[static_cast<size_t>(frame * kCodecDim + channel)];
+            }
+        }
+        core::write_tensor_f32(latent_input_, padded);
+        core::set_backend_threads(backend_, threads_);
+        const ggml_status status = engine::core::compute_backend_graph(backend_, graph_);
+        ggml_backend_synchronize(backend_);
+        if (status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("Fish Audio codec latent decode graph compute failed");
+        }
+        auto values = core::read_tensor_f32(output_);
+        const int64_t expected_samples = frames * assets_->config.codec.frame_length;
+        if (static_cast<int64_t>(values.size()) > expected_samples) {
+            values.resize(static_cast<size_t>(expected_samples));
+        }
+        return runtime::AudioBuffer{assets_->config.codec.sample_rate, 1, std::move(values)};
+    }
+
+private:
+    std::shared_ptr<const FishAudioAssets> assets_;
+    std::shared_ptr<const FishCodecWeights> weights_;
+    ggml_backend_t backend_ = nullptr;
+    core::BackendType backend_type_ = core::BackendType::Cpu;
+    int threads_ = 1;
+    int64_t frame_capacity_ = 0;
+    std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
+    core::TensorValue latent_input_;
+    ggml_tensor * output_ = nullptr;
+    ggml_cgraph * graph_ = nullptr;
+    std::unique_ptr<std::remove_pointer_t<ggml_gallocr_t>, GgmlGallocrDeleter> gallocr_;
+    core::ConstantTensorCache constants_;
+};
+
 struct EncodeGraph {
     EncodeGraph(
         std::shared_ptr<const FishAudioAssets> assets,
@@ -963,8 +1091,15 @@ struct EncodeGraph {
         ggml_set_input(input_.tensor);
         auto encoded = build_encoder(ctx, constants_, input_, *weights_);
         trace_outputs_.push_back({"fish_audio.codec.encoder_latent", encoded});
-        build_encode_quantizer(ctx, constants_, encoded, *weights_, code_outputs_, trace_outputs_);
+        core::TensorValue z_q;
+        build_encode_quantizer(ctx, constants_, encoded, *weights_, code_outputs_, trace_outputs_, &z_q);
+        // Continuous latents are what Echo-TTS conditions on; fish_audio itself
+        // only needs the codes, so this is an additional output rather than a
+        // change to the existing one.
+        z_q_output_ = core::ensure_backend_addressable_layout(ctx, z_q).tensor;
+        ggml_set_output(z_q_output_);
         graph_ = ggml_new_graph_custom(ctx_.get(), 1048576, false);
+        ggml_build_forward_expand(graph_, z_q_output_);
         for (const auto & trace_output : trace_outputs_) {
             ggml_set_output(trace_output.second.tensor);
             ggml_build_forward_expand(graph_, trace_output.second.tensor);
@@ -1032,10 +1167,30 @@ struct EncodeGraph {
         return out;
     }
 
+    // Continuous latents from the most recent encode, shaped
+    // (frames, kCodecDim) row-major. Valid only after encode_reference has run.
+    std::vector<float> read_z_q(int64_t frames) const {
+        auto values = core::read_tensor_f32(z_q_output_);
+        const size_t wanted = static_cast<size_t>(frames * kCodecDim);
+        if (values.size() < wanted) {
+            throw std::runtime_error("Fish Audio codec z_q output is smaller than the frame count");
+        }
+        // The graph is built for frame_capacity_; drop the padded tail.
+        std::vector<float> out(wanted);
+        for (int64_t frame = 0; frame < frames; ++frame) {
+            for (int64_t channel = 0; channel < kCodecDim; ++channel) {
+                out[static_cast<size_t>(frame * kCodecDim + channel)] =
+                    values[static_cast<size_t>(channel * frame_capacity_ + frame)];
+            }
+        }
+        return out;
+    }
+
 private:
     std::shared_ptr<const FishAudioAssets> assets_;
     std::shared_ptr<const FishCodecWeights> weights_;
     ggml_backend_t backend_ = nullptr;
+    ggml_tensor * z_q_output_ = nullptr;
     core::BackendType backend_type_ = core::BackendType::Cpu;
     int threads_ = 1;
     int64_t sample_capacity_ = 0;
@@ -1092,6 +1247,35 @@ public:
         return decode_graph_->run(codes);
     }
 
+    // Continuous-latent counterparts of encode_reference/decode, matching
+    // DAC.encode_zq and DAC.decode_zq in the upstream Echo-TTS autoencoder.
+    FishAudioLatents encode_zq(const runtime::AudioBuffer & audio) {
+        auto mono = prepare_codec_mono(audio, assets_->config.codec.sample_rate);
+        const int64_t samples = ceil_div(static_cast<int64_t>(mono.size()), assets_->config.codec.frame_length) *
+            assets_->config.codec.frame_length;
+        const int64_t frames = ceil_div(static_cast<int64_t>(mono.size()), assets_->config.codec.frame_length);
+        if (encode_graph_ == nullptr || !encode_graph_->matches(samples, frames, execution_.backend(), threads_)) {
+            encode_graph_ = std::make_unique<EncodeGraph>(assets_, weights_, execution_, graph_arena_bytes_, samples, frames);
+        }
+        // The codes are discarded; running the same graph keeps the quantiser
+        // path identical to encode_reference so the two cannot drift.
+        (void)encode_graph_->run(audio);
+        FishAudioLatents out;
+        out.frames = frames;
+        out.channels = kCodecDim;
+        out.values = encode_graph_->read_z_q(frames);
+        return out;
+    }
+
+    runtime::AudioBuffer decode_zq(const std::vector<float> & latents, int64_t frames) {
+        if (latent_decode_graph_ == nullptr ||
+            !latent_decode_graph_->matches(frames, execution_.backend(), threads_)) {
+            latent_decode_graph_ =
+                std::make_unique<LatentDecodeGraph>(assets_, weights_, execution_, graph_arena_bytes_, frames);
+        }
+        return latent_decode_graph_->run(latents, frames);
+    }
+
     void release_encode_graph() {
         encode_graph_.reset();
     }
@@ -1099,6 +1283,7 @@ public:
     void release_runtime_graphs() {
         encode_graph_.reset();
         decode_graph_.reset();
+        latent_decode_graph_.reset();
     }
 
 private:
@@ -1109,6 +1294,7 @@ private:
     std::shared_ptr<const FishCodecWeights> weights_;
     std::unique_ptr<EncodeGraph> encode_graph_;
     std::unique_ptr<DecodeGraph> decode_graph_;
+    std::unique_ptr<LatentDecodeGraph> latent_decode_graph_;
 };
 
 FishAudioCodecRuntime::FishAudioCodecRuntime(
@@ -1136,6 +1322,14 @@ FishAudioCodes FishAudioCodecRuntime::encode_reference(const runtime::AudioBuffe
 
 runtime::AudioBuffer FishAudioCodecRuntime::decode(const FishAudioCodes & codes) {
     return impl_->decode(codes);
+}
+
+FishAudioLatents FishAudioCodecRuntime::encode_zq(const runtime::AudioBuffer & audio) {
+    return impl_->encode_zq(audio);
+}
+
+runtime::AudioBuffer FishAudioCodecRuntime::decode_zq(const std::vector<float> & latents, int64_t frames) {
+    return impl_->decode_zq(latents, frames);
 }
 
 void FishAudioCodecRuntime::release_encode_graph() {

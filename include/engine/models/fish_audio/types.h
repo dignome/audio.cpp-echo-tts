@@ -9,6 +9,14 @@
 
 namespace engine::models::fish_audio {
 
+// Continuous quantiser latents (z_q), the boundary Echo-TTS shares with this
+// autoencoder. Stored (frames, channels) row-major.
+struct FishAudioLatents {
+    int64_t frames = 0;
+    int64_t channels = 0;
+    std::vector<float> values;
+};
+
 struct FishAudioGenerationOptions {
     int64_t max_new_tokens = 1024;
     int64_t text_chunk_size = 200;

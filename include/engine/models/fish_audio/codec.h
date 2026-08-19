@@ -5,7 +5,9 @@
 #include "engine/models/fish_audio/assets.h"
 #include "engine/models/fish_audio/types.h"
 
+#include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace engine::models::fish_audio {
 
@@ -23,6 +25,12 @@ public:
 
     FishAudioCodes encode_reference(const runtime::AudioBuffer & audio);
     runtime::AudioBuffer decode(const FishAudioCodes & codes);
+
+    // Continuous-latent access to the same autoencoder. Echo-TTS conditions on
+    // and generates z_q directly and never materialises codebook indices.
+    // `values` is (frames, channels) row-major.
+    FishAudioLatents encode_zq(const runtime::AudioBuffer & audio);
+    runtime::AudioBuffer decode_zq(const std::vector<float> & latents, int64_t frames);
     void release_encode_graph();
     void release_runtime_graphs();
 
