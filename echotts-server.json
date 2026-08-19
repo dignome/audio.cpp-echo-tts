@@ -1,0 +1,20 @@
+{
+  "host": "0.0.0.0",
+  "port": 8086,
+  "backend": "cuda",
+  "device": 0,
+  "threads": 1,
+  "lazy_load": false,
+  "models": [
+    {
+      "id": "echo_tts",
+      "family": "echo_tts",
+      "path": "/mnt/work/models/Echo-TTS-Q8",
+      "task": "clon",
+      "mode": "offline",
+      "default_request_options": {
+        "num_steps": 20
+      }
+    }
+  ]
+}
