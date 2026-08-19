@@ -130,6 +130,9 @@ EchoTtsSession::EchoTtsSession(
     if (contract_ == nullptr) {
         throw std::runtime_error("Echo-TTS session requires a model contract");
     }
+    // Without this a typo in server config is silently ignored.
+    runtime::validate_spec_backed_session_options(
+        RuntimeSessionBase::options(), *contract_, kFamily, "Echo-TTS");
     if (assets_ == nullptr) {
         throw std::runtime_error("Echo-TTS session requires loaded assets");
     }
@@ -206,6 +209,33 @@ void EchoTtsSession::prepare(const runtime::SessionPreparationRequest & request)
     mark_prepared();
 }
 
+int64_t EchoTtsSession::resolve_reference_max_samples(
+    const std::unordered_map<std::string, std::string> & request_options) const {
+    const auto & config = assets_->config;
+    const int64_t trained_max = config.max_speaker_latent_length * config.ae_downsample_factor;
+
+    // A per-request value wins; otherwise the session default from CLI or server
+    // config; otherwise the trained maximum. Request options are bare names,
+    // session options carry the family prefix -- parse_cli_options adds it for
+    // the session and load scopes only.
+    auto seconds = runtime::parse_float_option(request_options, {"reference_max_seconds"});
+    if (!seconds.has_value()) {
+        seconds = runtime::parse_float_option(
+            options().options, {"echo_tts.reference_max_seconds"});
+    }
+    if (!seconds.has_value()) {
+        return trained_max;
+    }
+    if (!(*seconds > 0.0F)) {
+        throw std::runtime_error("Echo-TTS reference_max_seconds must be positive");
+    }
+    const auto requested = static_cast<int64_t>(
+        static_cast<double>(*seconds) * static_cast<double>(kSampleRate));
+    // Clamped rather than rejected: asking for more than the model was trained
+    // on is a reasonable thing to type, and silently exceeding it is not.
+    return std::min<int64_t>(requested, trained_max);
+}
+
 void EchoTtsSession::encode_speaker(const runtime::AudioBuffer & audio) {
     const auto & config = assets_->config;
 
@@ -218,9 +248,13 @@ void EchoTtsSession::encode_speaker(const runtime::AudioBuffer & audio) {
     }
 
     const int64_t chunk_samples = config.speaker_chunk_latents * config.ae_downsample_factor;
-    const int64_t max_samples = config.max_speaker_latent_length * config.ae_downsample_factor;
-    if (static_cast<int64_t>(mono.size()) > max_samples) {
-        mono.resize(static_cast<size_t>(max_samples));
+    if (static_cast<int64_t>(mono.size()) > reference_max_samples_) {
+        if (echo_debug_enabled()) {
+            std::fprintf(stderr, "[echo_tts] reference trimmed %.2f s -> %.2f s\n",
+                         static_cast<double>(mono.size()) / kSampleRate,
+                         static_cast<double>(reference_max_samples_) / kSampleRate);
+        }
+        mono.resize(static_cast<size_t>(reference_max_samples_));
     }
     const int64_t actual_frames = static_cast<int64_t>(mono.size()) / config.ae_downsample_factor;
 
@@ -347,6 +381,7 @@ runtime::TaskResult EchoTtsSession::run(const runtime::TaskRequest & request) {
     }
 
     const auto sampler = parse_sampler_options(request.options);
+    reference_max_samples_ = resolve_reference_max_samples(request.options);
     // Encoded once per request; the timbre is then identical across chunk seams
     // by construction.
     encode_speaker(*request.voice->speaker->audio);

@@ -49,6 +49,10 @@ public:
     void reset();
 
 private:
+    // Reference trim limit: request option, else session default, else the
+    // trained maximum. Returned in samples at the codec rate.
+    int64_t resolve_reference_max_samples(
+        const std::unordered_map<std::string, std::string> & request_options) const;
     EchoSamplerOptions parse_sampler_options(
         const std::unordered_map<std::string, std::string> & options) const;
     // Encodes reference audio to 80-D PCA latents, mirroring
@@ -63,6 +67,7 @@ private:
     std::shared_ptr<const engine::model_spec::ModelContract> contract_;
     std::unique_ptr<EchoDitRuntime> dit_;
     std::unique_ptr<fish_audio::FishAudioCodecRuntime> codec_;
+    int64_t reference_max_samples_ = 0;
     std::vector<float> speaker_latent_;
     int64_t speaker_frames_ = 0;
 };

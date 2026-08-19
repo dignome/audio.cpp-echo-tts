@@ -181,6 +181,30 @@ their own block rather than a whole row -- and `k_norm` is F32 regardless.
 Quality has not been compared against F16 on real audio. Start with `orig` and
 treat Q8_0 as an experiment until someone listens to both.
 
+## Limiting the reference length
+
+`reference_max_seconds` trims the speaker reference before encoding. Shorter
+references cost less and often clone better -- upstream's guidance favours
+around 10 s, and a long clip averages timbre over more prosodic variation.
+
+Per request (bare name):
+
+```
+--request-option reference_max_seconds=30
+```
+
+As a default for a CLI run or a server, in the session scope (family-prefixed,
+which is how the framework namespaces session and load options):
+
+```
+--session-option echo_tts.reference_max_seconds=30
+```
+
+In a server config file the same key goes under `session_options`, with a string
+value. A request value overrides the session default. Values above the trained
+maximum of 297.1 s are clamped rather than rejected. Trimming happens before
+chunked encoding, so a cap also bounds encode time and VRAM.
+
 ## The Fish S1-DAC autoencoder
 
 Echo decodes its 80-D PCA latents through the Fish S1 DAC and encodes speaker

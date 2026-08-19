@@ -79,9 +79,22 @@
         "description": "RNG seed for the initial latent.",
         "required": false,
         "default": 0
+      },
+      {
+        "name": "reference_max_seconds",
+        "type": "float",
+        "required": false,
+        "description": "Trim the speaker reference to at most this many seconds before encoding. Shorter references are cheaper and often clone better; upstream's guidance favours around 10 s. Values above the trained maximum of 297.1 s are clamped. Set per request, or as a session default from CLI or server config."
       }
     ],
-    "session": [],
+    "session": [
+      {
+        "name": "reference_max_seconds",
+        "type": "float",
+        "required": false,
+        "description": "Trim the speaker reference to at most this many seconds before encoding. Shorter references are cheaper and often clone better; upstream's guidance favours around 10 s. Values above the trained maximum of 297.1 s are clamped. Set per request, or as a session default from CLI or server config."
+      }
+    ],
     "load": []
   },
   "packages": [
