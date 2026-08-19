@@ -35,7 +35,12 @@ for scope,items in opts.items():
     declared[scope]=set()
     for i,o in enumerate(items):
         pp=f"{P}.options.{scope}[{i}]"
-        n=req(o,'name',pp); req(o,'type',pp); req(o,'description',pp)
+        # schema.cpp::validate_option requires name, type and required.
+        # description is NOT required; this had it backwards, so specs that the
+        # C++ rejects at load time were passing here.
+        n=req(o,'name',pp); req(o,'type',pp); req(o,'required',pp)
+        if 'required' in o and not isinstance(o['required'], bool):
+            errs.append(f"{pp}.required: expected bool")
         if o.get('type') not in otypes: errs.append(f"{pp}.type '{o.get('type')}' not in {sorted(otypes)}")
         if n: declared[scope].add(n)
 # packages
