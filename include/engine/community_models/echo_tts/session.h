@@ -3,6 +3,7 @@
 #include "engine/community_models/echo_tts/config.h"
 #include "engine/framework/assets/resource_bundle.h"
 #include "engine/framework/model_spec/metadata.h"
+#include "engine/framework/runtime/cache_slots.h"
 #include "engine/framework/runtime/session_base.h"
 #include "engine/models/fish_audio/assets.h"
 #include "engine/models/fish_audio/codec.h"
@@ -26,6 +27,26 @@ struct EchoTtsAssets {
     // implementation but supplies the S1 weights its PCA basis was fitted to.
     // See docs/community_models/echo_tts_autoencoder_reuse.md.
     std::shared_ptr<const fish_audio::FishAudioAssets> codec_assets;
+};
+
+// Encoding a speaker reference is linear in its length -- a 4.5-minute clip is
+// ten Fish encode passes -- and the result depends only on the audio and the
+// trim length, so it is cached across requests. Servers reusing a handful of
+// voices then pay it once per voice rather than once per request.
+struct EchoReferenceIdentity {
+    std::string id;
+    int64_t max_samples = 0;
+};
+
+struct EchoReferenceIdentityEqual {
+    bool operator()(const EchoReferenceIdentity & a, const EchoReferenceIdentity & b) const {
+        return a.max_samples == b.max_samples && a.id == b.id;
+    }
+};
+
+struct EchoPreparedSpeaker {
+    std::vector<float> latent;
+    int64_t frames = 0;
 };
 
 std::shared_ptr<runtime::IVoiceModelLoader> make_echo_tts_loader();
@@ -70,6 +91,8 @@ private:
     int64_t reference_max_samples_ = 0;
     std::vector<float> speaker_latent_;
     int64_t speaker_frames_ = 0;
+    runtime::CacheSlots<EchoReferenceIdentity, EchoPreparedSpeaker, EchoReferenceIdentityEqual>
+        reference_cache_;
 };
 
 }  // namespace engine::models::echo_tts

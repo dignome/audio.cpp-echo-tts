@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdio>
@@ -66,6 +67,9 @@ constexpr int kSampleRate = 44100;
 // fast-reading text can still overrun it, which is the main prompt-dependent
 // failure mode; text_chunk_size overrides this per request.
 constexpr int64_t kDefaultTextChunkSize = 300;
+// Enough for a server rotating a few voices; each slot holds only the projected
+// latent, at most 6400 frames x 80 floats = 2 MB.
+constexpr std::size_t kDefaultReferenceCacheSlots = 4;
 
 bool echo_debug_enabled() {
     static const bool enabled = [] {
@@ -133,6 +137,16 @@ EchoTtsSession::EchoTtsSession(
     // Without this a typo in server config is silently ignored.
     runtime::validate_spec_backed_session_options(
         RuntimeSessionBase::options(), *contract_, kFamily, "Echo-TTS");
+    const auto slots = runtime::parse_int_option(
+        RuntimeSessionBase::options().options, {"echo_tts.reference_cache_slots"});
+    if (slots.has_value()) {
+        if (*slots < 0) {
+            throw std::runtime_error("echo_tts.reference_cache_slots must be non-negative");
+        }
+        reference_cache_.set_capacity(static_cast<std::size_t>(*slots));
+    } else {
+        reference_cache_.set_capacity(kDefaultReferenceCacheSlots);
+    }
     if (assets_ == nullptr) {
         throw std::runtime_error("Echo-TTS session requires loaded assets");
     }
@@ -236,8 +250,43 @@ int64_t EchoTtsSession::resolve_reference_max_samples(
     return std::min<int64_t>(requested, trained_max);
 }
 
+namespace {
+
+// Cheap content hash over the reference samples. A collision would swap one
+// speaker for another, so it mixes length, rate, channels and every sample
+// rather than sampling, and the cache key adds the trim length.
+std::string reference_identity(const runtime::AudioBuffer & audio) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    auto mix = [&hash](std::uint64_t value) {
+        hash ^= value;
+        hash *= 1099511628211ULL;
+    };
+    mix(static_cast<std::uint64_t>(audio.samples.size()));
+    mix(static_cast<std::uint64_t>(audio.sample_rate));
+    mix(static_cast<std::uint64_t>(audio.channels));
+    for (const float sample : audio.samples) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &sample, sizeof(bits));
+        mix(bits);
+    }
+    return std::to_string(hash);
+}
+
+}  // namespace
+
 void EchoTtsSession::encode_speaker(const runtime::AudioBuffer & audio) {
     const auto & config = assets_->config;
+
+    const EchoReferenceIdentity identity{reference_identity(audio), reference_max_samples_};
+    if (const auto * cached = reference_cache_.find(identity)) {
+        speaker_latent_ = cached->latent;
+        speaker_frames_ = cached->frames;
+        if (echo_debug_enabled()) {
+            std::fprintf(stderr, "[echo_tts] speaker reference cache hit (%lld frames)\n",
+                         static_cast<long long>(speaker_frames_));
+        }
+        return;
+    }
 
     // Mixed down and resampled once, so chunk boundaries land on exact codec
     // frames rather than on pre-resample sample indices.
@@ -292,6 +341,7 @@ void EchoTtsSession::encode_speaker(const runtime::AudioBuffer & audio) {
     latents.resize(static_cast<size_t>(frames * config.latent_size));
     speaker_latent_ = std::move(latents);
     speaker_frames_ = frames;
+    reference_cache_.put(identity, EchoPreparedSpeaker{speaker_latent_, speaker_frames_});
 }
 
 runtime::AudioBuffer EchoTtsSession::synthesize_chunk(

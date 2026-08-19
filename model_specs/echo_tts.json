@@ -93,6 +93,12 @@
         "type": "float",
         "required": false,
         "description": "Trim the speaker reference to at most this many seconds before encoding. Shorter references are cheaper and often clone better; upstream's guidance favours around 10 s. Values above the trained maximum of 297.1 s are clamped. Set per request, or as a session default from CLI or server config."
+      },
+      {
+        "name": "reference_cache_slots",
+        "type": "int",
+        "required": false,
+        "description": "How many encoded speaker references to keep. Encoding is linear in reference length, so reusing a voice across requests avoids repeating it. 0 disables caching; default 4."
       }
     ],
     "load": []

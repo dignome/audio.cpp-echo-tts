@@ -205,6 +205,26 @@ value. A request value overrides the session default. Values above the trained
 maximum of 297.1 s are clamped rather than rejected. Trimming happens before
 chunked encoding, so a cap also bounds encode time and VRAM.
 
+## Reference encoding cost
+
+Encoding the speaker reference is linear in its length: one Fish encode pass per
+~29.7 s chunk, so a 4m29s clip is ten passes against one for a 28 s clip. At the
+trained maximum that is roughly 22% of a request's arithmetic, before per-graph
+launch overhead.
+
+The result depends only on the audio and the trim length, so it is cached across
+requests. A server rotating a few voices pays the cost once per voice instead of
+once per request:
+
+```
+--session-option echo_tts.reference_cache_slots=8
+```
+
+Default 4; `0` disables it. Each slot holds only the projected latent, at most
+2 MB. The cache lives with the session, so it helps a running server and not a
+one-shot CLI invocation. Beyond caching, the levers are `reference_max_seconds`
+and shorter references generally -- around 10 s is one chunk, the floor.
+
 ## The Fish S1-DAC autoencoder
 
 Echo decodes its 80-D PCA latents through the Fish S1 DAC and encodes speaker
