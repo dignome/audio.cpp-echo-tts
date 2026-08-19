@@ -12,12 +12,17 @@ python tools/community_models/convert_echo_tts.py   --model-dir /mnt/work/models
 
 Run the model:
 
+For some debugging can preface below command with AUDIOCPP_ECHO_TTS_DEBUG=1
+
 ./build/linux-cuda-release/bin/audiocpp_cli   --family echo_tts   --model /mnt/work/models/Echo-TTS-Q8   --task clon   --voice-ref audio_prompts/speaker1.wav   --text "[S1] This is a test of the echo TTS model."  --backend cuda  --out out.wav
 
 optional params:
 - --request-option num_steps=40 (as low as 8 still sounds acceptable with faster generation)
 - --request-option seed=420
 - --request-option cfg_scale_speaker=16
+<br /><br />
+<br /><br />
+This was entirely vibe coded so perhaps it is useful as inspiration to write a proper submission for audio.cpp but I'd rather not try to merge this myself.
 <br /><br /><br /><br /><br /><br /><br /><br /><br />
 [![0xShug0/audio.cpp | Trendshift](https://trendshift.io/api/badge/trendshift/repositories/64983/daily?language=C%2B%2B)](https://trendshift.io/repositories/64983?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-64983)
 
