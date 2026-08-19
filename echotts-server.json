@@ -5,6 +5,7 @@
   "device": 0,
   "threads": 1,
   "lazy_load": false,
+	"voice_dir": "/mnt/work/voices",
   "models": [
     {
       "id": "echo_tts",
