@@ -1,5 +1,24 @@
 # audio.cpp
 
+Used Claude Opus to generate Echo TTS support using [PR #180](https://github.com/0xShug0/audio.cpp/pull/180) as a guide.  Includes gguf conversion script that can generate full weight or Q8-ish gguf version from the echo base weights and s1 codec weights.
+
+Example Usage:
+
+Generate GGUF both full precision and Q8
+
+python tools/community_models/convert_echo_tts.py   --model-dir /mnt/work/models/echo-tts   --fish-dir /mnt/work/models/fish-s1-dac-min   --outfile /mnt/work/models/Echo-TTS-Q8/model.gguf --precision q8_0
+
+python tools/community_models/convert_echo_tts.py   --model-dir /mnt/work/models/echo-tts   --fish-dir /mnt/work/models/fish-s1-dac-min   --outfile /mnt/work/models/Echo-TTS-GGUF/model.gguf --precision orig
+
+Run the model:
+
+./build/linux-cuda-release/bin/audiocpp_cli   --family echo_tts   --model /mnt/work/models/Echo-TTS-Q8   --task clon   --voice-ref audio_prompts/speaker1.wav   --text "[S1] This is a test of the echo TTS model."  --backend cuda  --out out.wav
+
+optional params:
+- --request-option num_steps=40 (as low as 8 still sounds acceptable with faster generation)
+- --request-option seed=420
+- --request-option cfg_scale_speaker=16
+<br /><br /><br /><br /><br /><br /><br /><br /><br />
 [![0xShug0/audio.cpp | Trendshift](https://trendshift.io/api/badge/trendshift/repositories/64983/daily?language=C%2B%2B)](https://trendshift.io/repositories/64983?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-64983)
 
 `audio.cpp` is a high-performance C++ audio inference framework built on top of `ggml`, designed to make modern local audio models practical, portable, and fast.
