@@ -17,7 +17,7 @@ For some debugging can preface below command with AUDIOCPP_ECHO_TTS_DEBUG=1
 ./build/linux-cuda-release/bin/audiocpp_cli   --family echo_tts   --model /mnt/work/models/Echo-TTS-Q8   --task clon   --voice-ref audio_prompts/speaker1.wav   --text "[S1] This is a test of the echo TTS model."  --backend cuda  --out out.wav
 
 optional params:
-- --request-option num_steps=40 (as low as 8 still sounds acceptable with faster generation)
+- --request-option num_steps=40 (as low as 8 still sounds acceptable with faster generation - depends on quality of your reference audio)
 - --request-option seed=420
 - --request-option cfg_scale_speaker=16
 <br /><br />
