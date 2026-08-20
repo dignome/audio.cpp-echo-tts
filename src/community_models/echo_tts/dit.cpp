@@ -501,9 +501,16 @@ private:
             throw std::runtime_error("Echo-TTS KV cache context initialization failed");
         }
         core::ModuleBuildContext ctx{kv_ctx_.get(), "echo_tts.kv_cache", backend_type_};
+        // The cache is allocated at the widest lane count any graph will ask
+        // for, so joint_attention's expand() finds dims[0] already equal to the
+        // batch and short-circuits to a passthrough. The single-lane graph
+        // reads lane 0, which is a contiguous prefix because the lane axis is
+        // outermost in ggml's layout.
+        kv_lanes_ = echo_kv_expand_disabled() ? 1 : kMaxCfgLanes;
         auto make = [&](int64_t tokens) {
             return core::make_tensor(
-                ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, tokens, heads, head_dim}));
+                ctx, GGML_TYPE_F32,
+                core::TensorShape::from_dims({kv_lanes_, tokens, heads, head_dim}));
         };
         for (int64_t layer = 0; layer < config_.num_layers; ++layer) {
             kv_.k_text.push_back(make(text_length_));
@@ -604,6 +611,16 @@ private:
                 if (normalise) {
                     value = head_rms_norm(ctx, value, attn.k_norm.weight, config_.norm_eps);
                 }
+                if (kv_lanes_ > 1) {
+                    // Broadcast to the cache's lane count once, here, instead of
+                    // once per layer per sampler step inside joint_attention.
+                    // Upstream's _concat_kv_caches(cond, cond, cond) is the same
+                    // operation; only its position in the schedule changes.
+                    value = modules::RepeatModule(
+                                {core::TensorShape::from_dims(
+                                    {kv_lanes_, tokens, heads, head_dim})})
+                                .build(ctx, contiguous(ctx, value));
+                }
                 return value;
             };
             struct Slot {
@@ -630,6 +647,25 @@ private:
             throw std::runtime_error("Echo-TTS conditioning graph allocation failed");
         }
         core::prepare_host_graph_plan(execution_, conditioning_graph_, conditioning_plan_);
+    }
+
+    // Reconciles the cache's lane count with the graph's.
+    //
+    // With pre-expansion on, the cache is allocated at kMaxCfgLanes and the
+    // single-lane graph reads a prefix of it; the lane axis is outermost, so
+    // that is a view with no copy.
+    //
+    // With pre-expansion off (AUDIOCPP_ECHO_TTS_NO_KV_EXPAND=1) the cache is
+    // batch-1 and the three-lane graph is *wider* than it. Narrowing is not
+    // possible and not wanted: returning the cache unchanged leaves
+    // joint_attention's expand() to broadcast it per step, which is exactly the
+    // pre-patch behaviour the flag exists to restore.
+    core::TensorValue kv_for_lanes(
+        core::ModuleBuildContext & ctx, const core::TensorValue & cached, int lanes) const {
+        if (cached.shape.dims[0] <= static_cast<int64_t>(lanes)) {
+            return cached;
+        }
+        return modules::SliceModule({0, 0, static_cast<int64_t>(lanes)}).build(ctx, cached);
     }
 
     void build_denoiser_graph(DenoiserGraph & target, int lanes) {
@@ -697,8 +733,10 @@ private:
             const size_t index = static_cast<size_t>(layer);
             hidden = dit_block(
                 ctx, hidden, cond, target.positions,
-                kv_.k_text[index], kv_.v_text[index],
-                kv_.k_speaker[index], kv_.v_speaker[index],
+                kv_for_lanes(ctx, kv_.k_text[index], lanes),
+                kv_for_lanes(ctx, kv_.v_text[index], lanes),
+                kv_for_lanes(ctx, kv_.k_speaker[index], lanes),
+                kv_for_lanes(ctx, kv_.v_speaker[index], lanes),
                 target.mask, weights_.blocks[index], config_);
         }
         hidden = rms_norm(ctx, hidden, weights_.out_norm.weight, config_.norm_eps);
@@ -774,6 +812,7 @@ private:
     int64_t speaker_frames_ = 0;
     int64_t speaker_tokens_ = 0;
     int64_t sequence_length_ = 640;
+    int64_t kv_lanes_ = 1;
     std::vector<float> text_mask_;
     std::vector<float> speaker_mask_;
 

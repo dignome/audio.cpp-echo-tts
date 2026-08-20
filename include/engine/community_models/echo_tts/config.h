@@ -168,11 +168,39 @@ struct EchoSamplerOptions {
     float cfg_scale_speaker = 8.0F;
     float cfg_min_t = 0.5F;
     float cfg_max_t = 1.0F;
+    // Evaluate the two unconditional lanes only every Nth step inside the CFG
+    // window, reusing the previous guidance correction in between. 1 reproduces
+    // upstream exactly.
+    //
+    // The correction -- w_text*(v_cond - v_text) + w_speaker*(v_cond - v_speaker)
+    // -- varies slowly in t even though v_cond does not, so it tolerates being
+    // resampled. What matters is how many times it is actually measured across
+    // the guided phase, which is num_steps/2 rounded up, divided by this value:
+    //
+    //   num_steps=40, interval=2 -> 10 refreshes, 80 -> 60 lane-evals (1.33x)
+    //   num_steps=30, interval=2 ->  8 refreshes, 60 -> 46 lane-evals (1.30x)
+    //   num_steps=14, interval=2 ->  4 refreshes, 28 -> 22 lane-evals (1.27x)
+    //
+    // Ten refreshes is dense enough that each reused correction is one small
+    // t-step stale; four is not. So this is worth raising at 30+ steps and is
+    // not worth it at 14, where the correction is already coarsely sampled and
+    // the speaker term's weight of 8.0 multiplies any staleness straight into
+    // timbre and pronunciation -- a failure mode you hear rather than see.
+    //
+    // Note that num_steps=40 with interval=2 and num_steps=30 with interval=1
+    // both cost 60 lane-evals. They spend the same compute differently: fewer
+    // steps coarsens the whole ODE trajectory, while a longer interval leaves
+    // the trajectory intact and only lets the guidance go stale. Neither
+    // dominates on paper; compare them by listening before committing.
+    int cfg_interval = 1;
     std::optional<float> truncation_factor = 0.8F;
     std::optional<float> speaker_kv_scale;
     std::optional<int> speaker_kv_max_layers;
     std::optional<float> speaker_kv_min_t;
     int64_t sequence_length = 640;
+    // True when the caller pinned sequence_length explicitly, which suppresses
+    // the per-chunk window estimate.
+    bool window_pinned = false;
     uint64_t seed = 0;
 };
 

@@ -1,5 +1,6 @@
 #include "engine/community_models/echo_tts/sampler.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -78,6 +79,14 @@ std::vector<float> run_euler_sampler(
     const auto schedule = euler_timestep_schedule(options.num_steps);
     bool kv_scaled = options.speaker_kv_scale.has_value();
 
+    const int cfg_interval = std::max(1, options.cfg_interval);
+    // Guidance correction carried between refreshes when cfg_interval > 1. This
+    // is the whole additive term, w_text * (v_cond - v_text) + w_speaker *
+    // (v_cond - v_speaker), held in absolute units rather than as a ratio so a
+    // reused correction cannot amplify a small v_cond.
+    std::vector<float> cfg_delta;
+    int steps_since_refresh = 0;
+
     for (int step = 0; step < options.num_steps; ++step) {
         const float t = schedule[static_cast<size_t>(step)];
         const float t_next = schedule[static_cast<size_t>(step) + 1];
@@ -85,9 +94,34 @@ std::vector<float> run_euler_sampler(
 
         std::vector<float> v_pred;
         if (use_cfg) {
-            auto lanes = denoise(x_t, t, 3);
-            v_pred = combine_cfg_lanes(
-                lanes, elements, options.cfg_scale_text, options.cfg_scale_speaker);
+            // The first CFG step always refreshes, so a stale delta is never
+            // applied before one has been measured.
+            const bool refresh = cfg_delta.empty() || steps_since_refresh >= cfg_interval - 1;
+            if (refresh) {
+                auto lanes = denoise(x_t, t, 3);
+                if (static_cast<int64_t>(lanes.size()) != elements * 3) {
+                    throw std::runtime_error("Echo-TTS denoiser returned mis-shaped CFG lanes");
+                }
+                v_pred = combine_cfg_lanes(
+                    lanes, elements, options.cfg_scale_text, options.cfg_scale_speaker);
+                if (cfg_interval > 1) {
+                    cfg_delta.resize(static_cast<size_t>(elements));
+                    for (int64_t i = 0; i < elements; ++i) {
+                        cfg_delta[static_cast<size_t>(i)] =
+                            v_pred[static_cast<size_t>(i)] - lanes[static_cast<size_t>(i)];
+                    }
+                }
+                steps_since_refresh = 0;
+            } else {
+                v_pred = denoise(x_t, t, 1);
+                if (static_cast<int64_t>(v_pred.size()) != elements) {
+                    throw std::runtime_error("Echo-TTS denoiser returned a mis-shaped velocity");
+                }
+                for (int64_t i = 0; i < elements; ++i) {
+                    v_pred[static_cast<size_t>(i)] += cfg_delta[static_cast<size_t>(i)];
+                }
+                ++steps_since_refresh;
+            }
         } else {
             v_pred = denoise(x_t, t, 1);
             if (static_cast<int64_t>(v_pred.size()) != elements) {

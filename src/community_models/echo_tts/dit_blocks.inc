@@ -29,6 +29,10 @@ constexpr size_t kWeightContextBytes = 6144ull * 1024ull * 1024ull;
 constexpr size_t kGraphArenaBytes = 512ull * 1024ull * 1024ull;
 constexpr float kRopeTheta = 10000.0F;
 
+// cond, text-uncond, speaker-uncond. The KV cache is sized to this so the
+// three-lane graph never has to broadcast it at sampling time.
+constexpr int64_t kMaxCfgLanes = 3;
+
 // Additive mask value for disallowed keys. -INFINITY would be exact but
 // produces NaN when an entire row is masked, which happens for the
 // speaker-uncond CFG lane; a large finite penalty is the standard ggml
@@ -54,6 +58,19 @@ using GgmlContextPtr = std::unique_ptr<ggml_context, GgmlContextDeleter>;
 bool echo_flash_disabled() {
     static const bool disabled = [] {
         const char * value = std::getenv("AUDIOCPP_ECHO_TTS_NO_FLASH");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return disabled;
+}
+
+// Pre-broadcasting the conditioning KV cache across the CFG lanes moves a
+// per-layer, per-step RepeatModule out of the denoiser graph and into the
+// once-per-request conditioning graph. At 24 layers x 40 steps the repeat it
+// removes is tens of gigabytes of pure copy traffic on a long reference.
+// Set AUDIOCPP_ECHO_TTS_NO_KV_EXPAND=1 to fall back to the batch-1 cache.
+bool echo_kv_expand_disabled() {
+    static const bool disabled = [] {
+        const char * value = std::getenv("AUDIOCPP_ECHO_TTS_NO_KV_EXPAND");
         return value != nullptr && value[0] != '\0' && value[0] != '0';
     }();
     return disabled;

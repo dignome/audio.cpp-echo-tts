@@ -11,14 +11,15 @@
       "id": "echo_tts",
       "family": "echo_tts",
       "path": "/mnt/work/models/Echo-TTS-Q8",
+      "model_spec_override": "model_specs/echo_tts.json",
       "task": "clon",
       "mode": "offline",
       "session_options": {
         "echo_tts.reference_cache_slots": "8",
-        "echo_tts.reference_max_seconds": "30"
+        "echo_tts.reference_max_seconds": "15"
       },
       "default_request_options": {
-        "num_steps": 20
+        "num_steps": 15
       }
     }
   ]

@@ -71,6 +71,60 @@ constexpr int64_t kDefaultTextChunkSize = 300;
 // latent, at most 6400 frames x 80 floats = 2 MB.
 constexpr std::size_t kDefaultReferenceCacheSlots = 4;
 
+// Default reference trim. Every speaker token stays resident in `keys` for
+// every attention in every block at every sampler step, and the speaker encoder
+// itself is linear in reference length, so an untrimmed 4.5-minute clip charges
+// 1600 tokens to all 24 blocks x 40 steps. 15 s is ~81 tokens, and the model
+// card's own guidance is that ~10 s clones at least as well. Override with
+// reference_max_seconds per request or echo_tts.reference_max_seconds per
+// session; the trained maximum is still reachable that way.
+constexpr int64_t kDefaultReferenceMaxSamples = 15 * kSampleRate;
+
+// Adaptive generation window.
+//
+// Denoiser cost is linear in sequence_length for the projections and the MLP,
+// and worse than linear for the self block of the attention, so generating the
+// full 640-latent window for a six-second sentence pays roughly five times over
+// for latents that find_flattening_point then discards.
+//
+// The byte-to-frame rate is fixed by the model: 640 frames span 29.7215 s, so
+// one second is 21.53 frames. kDefaultTextChunkSize is documented in this file
+// as ~20 s of typical English at 300 codepoints, i.e. ~15 bytes/s, which puts
+// the ratio at 21.53 / 15 = 1.435 frames per UTF-8 byte. The margin covers
+// slower delivery, and a short utterance still needs room for the leading
+// silence and the flat tail the crop looks for.
+constexpr float kFramesPerTextByte = 1.435F;
+constexpr float kWindowMargin = 1.30F;
+constexpr int64_t kMinWindowFrames = 128;
+// Denoiser graphs are keyed on sequence_length and rebuilt whenever it changes,
+// so estimates are snapped to a coarse grid: consecutive chunks of similar
+// length then reuse the same graph and the same gallocr reservation.
+constexpr int64_t kWindowQuantum = 64;
+
+bool echo_adaptive_window_disabled() {
+    static const bool disabled = [] {
+        const char * value = std::getenv("AUDIOCPP_ECHO_TTS_NO_ADAPTIVE_WINDOW");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return disabled;
+}
+
+// Rounds `frames` up to the graph-reuse grid and clamps into range.
+int64_t quantize_window(int64_t frames, int64_t max_frames) {
+    frames = std::max<int64_t>(frames, kMinWindowFrames);
+    frames = ((frames + kWindowQuantum - 1) / kWindowQuantum) * kWindowQuantum;
+    return std::min<int64_t>(frames, max_frames);
+}
+
+// Predicts how many latents this chunk needs. Deliberately generous: a window
+// that is too short costs a full-length retry, while one that is slightly too
+// long only wastes the difference.
+int64_t estimate_window_frames(int64_t text_bytes, int64_t max_frames) {
+    const auto predicted = static_cast<int64_t>(
+        std::ceil(static_cast<double>(text_bytes) * kFramesPerTextByte * kWindowMargin));
+    return quantize_window(predicted, max_frames);
+}
+
 bool echo_debug_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("AUDIOCPP_ECHO_TTS_DEBUG");
@@ -184,7 +238,24 @@ EchoSamplerOptions EchoTtsSession::parse_sampler_options(
     if (const auto seed = runtime::parse_int_option(options, {"seed"})) {
         sampler.seed = static_cast<uint64_t>(std::max(0, *seed));
     }
+    // The window defaults to the trained maximum. synthesize_chunk narrows it
+    // per chunk unless the caller pins it here, in which case the estimate is
+    // skipped entirely and the requested value is used verbatim.
     sampler.sequence_length = assets_->config.max_sequence_length;
+    if (const auto window = runtime::parse_int_option(options, {"sequence_length"})) {
+        if (*window <= 0 || *window > assets_->config.max_sequence_length) {
+            throw std::runtime_error(
+                "Echo-TTS sequence_length must be in 1..max_sequence_length");
+        }
+        sampler.sequence_length = *window;
+        sampler.window_pinned = true;
+    }
+    if (const auto interval = runtime::parse_int_option(options, {"cfg_interval"})) {
+        if (*interval < 1) {
+            throw std::runtime_error("Echo-TTS cfg_interval must be at least 1");
+        }
+        sampler.cfg_interval = *interval;
+    }
     if (sampler.num_steps <= 0) {
         throw std::runtime_error("Echo-TTS num_steps must be positive");
     }
@@ -238,7 +309,7 @@ int64_t EchoTtsSession::resolve_reference_max_samples(
             options().options, {"echo_tts.reference_max_seconds"});
     }
     if (!seconds.has_value()) {
-        return trained_max;
+        return kDefaultReferenceMaxSamples;
     }
     if (!(*seconds > 0.0F)) {
         throw std::runtime_error("Echo-TTS reference_max_seconds must be positive");
@@ -365,17 +436,50 @@ runtime::AudioBuffer EchoTtsSession::synthesize_chunk(
     conditioning.speaker_frames = speaker_frames_;
 
     dit_->prepare_conditioning(conditioning);
-    auto latent = dit_->sample(sampler);
+
+    // Adaptive window. The estimate is attempted first; a missing flattening
+    // point means the model was still speaking when the window closed, so the
+    // chunk is regenerated once at the full trained length. The seed is
+    // unchanged between attempts, so the retry is the run that would have
+    // happened without this optimisation -- an under-estimate costs time, never
+    // fidelity.
+    EchoSamplerOptions attempt = sampler;
+    const bool adaptive = !sampler.window_pinned && !echo_adaptive_window_disabled();
+    if (adaptive) {
+        attempt.sequence_length = estimate_window_frames(
+            static_cast<int64_t>(tokens.input_ids.size()), config.max_sequence_length);
+    }
+
+    std::vector<float> latent;
+    int64_t frames = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+        latent = dit_->sample(attempt);
+        frames = find_flattening_point(latent, attempt.sequence_length, config.latent_size);
+        const bool ran_out = frames >= attempt.sequence_length;
+        const bool can_retry =
+            adaptive && ran_out && attempt.sequence_length < config.max_sequence_length;
+        if (!can_retry) {
+            break;
+        }
+        if (echo_debug_enabled()) {
+            std::fprintf(
+                stderr,
+                "[echo_tts] window estimate of %lld frames was short for %lld bytes; "
+                "retrying at %lld\n",
+                static_cast<long long>(attempt.sequence_length),
+                static_cast<long long>(tokens.input_ids.size()),
+                static_cast<long long>(config.max_sequence_length));
+        }
+        attempt.sequence_length = config.max_sequence_length;
+    }
     report_stats("sampler.latent", latent);
 
     // The generated tail goes flat once the model finishes speaking; cropping
     // there is what sets the output duration.
-    const int64_t frames = find_flattening_point(
-        latent, sampler.sequence_length, config.latent_size);
     const double window_seconds =
-        static_cast<double>(sampler.sequence_length * config.ae_downsample_factor) /
+        static_cast<double>(attempt.sequence_length * config.ae_downsample_factor) /
         static_cast<double>(config.sample_rate);
-    if (frames >= sampler.sequence_length) {
+    if (frames >= attempt.sequence_length) {
         // No flat tail means the model was still speaking when the window ended,
         // so the audio is cut mid-utterance. Almost always too much text for one
         // chunk rather than a sampling problem.
@@ -391,7 +495,7 @@ runtime::AudioBuffer EchoTtsSession::synthesize_chunk(
             "[echo_tts] chunk: %lld tokens -> %lld/%lld frames (%.2f s of %.2f s window)\n",
             static_cast<long long>(tokens.input_ids.size()),
             static_cast<long long>(frames),
-            static_cast<long long>(sampler.sequence_length),
+            static_cast<long long>(attempt.sequence_length),
             static_cast<double>(frames * config.ae_downsample_factor) /
                 static_cast<double>(config.sample_rate),
             window_seconds);
@@ -402,7 +506,7 @@ runtime::AudioBuffer EchoTtsSession::synthesize_chunk(
     if (echo_session_debug_enabled()) {
         std::fprintf(stderr, "  %-26s %lld of %lld frames (%.3f s)\n",
                      "flattening_point", static_cast<long long>(frames),
-                     static_cast<long long>(sampler.sequence_length),
+                     static_cast<long long>(attempt.sequence_length),
                      static_cast<double>(frames * config.ae_downsample_factor) /
                          static_cast<double>(config.sample_rate));
     }
