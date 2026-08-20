@@ -19,7 +19,8 @@
         "echo_tts.reference_max_seconds": "15"
       },
       "default_request_options": {
-        "num_steps": 15
+        "num_steps": 14,
+	"cfg_interval": 1
       }
     }
   ]

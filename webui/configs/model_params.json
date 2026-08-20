@@ -37,7 +37,8 @@
   ],
 
   "echo_tts": [
-    {"name": "num_steps", "type": "slider", "label": "Sampling steps", "default": 20, "minimum": 8, "maximum": 40, "step": 1, "precision": 0, "info": "Number of Euler sampling steps."}
+    {"name": "num_steps", "type": "slider", "label": "Sampling steps", "default": 20, "minimum": 8, "maximum": 40, "step": 1, "precision": 0, "info": "Number of Euler sampling steps."},
+		{"name": "cfg_interval", "type": "slider", "label": "Interval", "default": 1, "minimum": 1, "maximum": 3, "step": 1, "precision": 0, "info": "CFG refresh interval. Higher values improve speed and work best with more generation steps; 1 gives the highest fidelity."}
   ],
 
   "chatterbox": [
