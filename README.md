@@ -26,6 +26,8 @@ Server:<br /><br />
 ./build/linux-cuda-release/bin/audiocpp_server --config echotts-server.json
 <br /><br /><br /><br />
 This was entirely vibe coded so perhaps it is useful as inspiration to write a proper submission for audio.cpp but I'd rather not try to merge this myself.
+
+Significant portions of the code are based on Jordan Darefsky's project [echo-tts](https://github.com/jordandare/echo-tts)
 <br /><br /><br /><br /><br /><br /><br /><br /><br />
 [![0xShug0/audio.cpp | Trendshift](https://trendshift.io/api/badge/trendshift/repositories/64983/daily?language=C%2B%2B)](https://trendshift.io/repositories/64983?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-64983)
 
